@@ -79,6 +79,10 @@ main{padding:14px;display:grid;gap:14px}.grid{display:grid;grid-template-columns
  <h2>Cadangkan dan pulihkan data</h2>
  <div class="notice warning">Data tersimpan di browser/perangkat ini. Kalau data browser dihapus atau ganti HP, data bisa hilang. Ekspor cadangan secara berkala dan simpan di tempat aman. Impor cadangan akan mengganti data aplikasi yang ada.</div>
  <div class="btnrow"><button class="btn" id="backupBtn">Unduh cadangan JSON</button><label class="btn secondary" for="restoreFile" style="margin:0;cursor:pointer">Pulihkan cadangan</label><input id="restoreFile" class="hidden" type="file" accept=".json,application/json"></div>
+ <h2 style="margin-top:22px">Impor riwayat lama tanpa mengubah saldo</h2>
+ <p class="small">Pilih file JSON cadangan lama. Transaksi akan ditambahkan sebagai riwayat laporan, ditandai RIWAYAT LAMA, dan tidak mengubah saldo rekening saat ini. Rekening dan saldo awal yang sekarang tidak akan diganti.</p>
+ <div class="btnrow"><label class="btn secondary" for="historyImportFile" style="margin:0;cursor:pointer">Impor riwayat JSON</label><input id="historyImportFile" class="hidden" type="file" accept=".json,application/json"></div>
+ <div id="historyImportStatus" class="small" style="margin-top:8px"></div>
  <h2 style="margin-top:22px">Aturan pembukuan</h2>
  <ul class="small" style="padding-left:20px;line-height:1.8">
   <li>Pemasukan menambah saldo rekening yang dipilih.</li><li>Pengeluaran mengurangi saldo rekening yang dipilih.</li><li>Transfer mengurangi rekening asal dan menambah rekening tujuan dengan nominal yang sama.</li><li>Investasi dan dana khusus dipisahkan dari total saldo kas/rekening.</li><li>Setiap transaksi punya tanggal, kategori, nominal, dan keterangan.</li>
@@ -106,6 +110,7 @@ function monthNow(){return localDate().slice(0,7);}
 function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function acct(id){return db.accounts.find(a=>a.id===id);}
 function signedDelta(tx,accountId){
+ if(tx.historicalOnly) return 0;
  if(tx.type==='income')return tx.accountId===accountId?tx.amount:0;
  if(tx.type==='expense')return tx.accountId===accountId?-tx.amount:0;
  if(tx.type==='transfer')return (tx.accountId===accountId?-tx.amount:0)+(tx.toAccountId===accountId?tx.amount:0);
@@ -194,9 +199,9 @@ function renderHistory(){
  const m=document.getElementById('filterMonth').value||monthNow(),type=document.getElementById('filterType').value;
  const txs=db.transactions.filter(t=>(!m||txMonth(t)===m)&&(type==='all'||t.type===type)).slice().sort((a,b)=>(b.date+a.createdAt).localeCompare(a.date+b.createdAt));
  document.getElementById('historyList').innerHTML=txs.length?txs.map(t=>{
- let detail=t.type==='transfer'?`${esc(acct(t.accountId)?.name||'Rekening dihapus')} → ${esc(acct(t.toAccountId)?.name||'Rekening dihapus')}`:esc(acct(t.accountId)?.name||'Rekening dihapus');
+ let detail=t.type==='transfer'?`${esc(acct(t.accountId)?.name||t.historicalAccountName||'Rekening lama')} → ${esc(acct(t.toAccountId)?.name||t.historicalToAccountName||'Rekening tujuan lama')}`:esc(acct(t.accountId)?.name||t.historicalAccountName||'Rekening lama');
  let amt=t.type==='income'?`<span class="good">+${money(t.amount)}</span>`:t.type==='expense'?`<span class="bad">−${money(t.amount)}</span>`:money(t.amount);
- return `<div class="tx"><div style="min-width:0"><div class="tx-title">${esc(t.note||txCategory(t))}</div><div class="tx-sub">${esc(t.date)} • ${typeLabel(t)} • ${detail}</div><span class="pill">${esc(txCategory(t))}${t.consumption?' • konsumsi':''}</span></div><div class="right"><div class="tx-amount">${amt}</div><button class="btn danger compact" style="margin-top:7px" onclick="deleteTx('${t.id}')">Hapus</button></div></div>`;
+ return `<div class="tx"><div style="min-width:0"><div class="tx-title">${esc(t.note||txCategory(t))}</div><div class="tx-sub">${esc(t.date)} • ${typeLabel(t)} • ${detail}</div><span class="pill">${esc(txCategory(t))}${t.consumption?' • konsumsi':''}${t.historicalOnly?' • RIWAYAT LAMA (saldo tidak berubah)':''}</span></div><div class="right"><div class="tx-amount">${amt}</div><button class="btn danger compact" style="margin-top:7px" onclick="deleteTx('${t.id}')">Hapus</button></div></div>`;
  }).join(''):'<div class="empty">Belum ada transaksi untuk filter ini.</div>';
 }
 document.getElementById('filterMonth').value=monthNow();
@@ -213,6 +218,48 @@ document.getElementById('restoreFile').addEventListener('change',async e=>{
  const f=e.target.files[0];if(!f)return;try{const x=JSON.parse(await f.text());if(!Array.isArray(x.accounts)||!Array.isArray(x.transactions))throw new Error();if(confirm('Pulihkan cadangan akan mengganti seluruh data aplikasi saat ini. Lanjutkan?')){db=x;save();alert('Cadangan berhasil dipulihkan.');}}catch(err){alert('File cadangan tidak valid.');}e.target.value='';
 });
 document.getElementById('resetBtn').addEventListener('click',()=>{if(confirm('Yakin menghapus SEMUA rekening dan transaksi dari perangkat ini? Unduh cadangan dulu jika perlu.')){db={accounts:[],transactions:[],createdAt:new Date().toISOString()};save();showTab('dashboard');}});
+
+document.getElementById('historyImportFile').addEventListener('change',async e=>{
+ const file=e.target.files[0]; if(!file)return;
+ const status=document.getElementById('historyImportStatus');
+ try{
+  const payload=JSON.parse(await file.text());
+  if(!Array.isArray(payload.transactions)) throw new Error('File tidak memiliki daftar transaksi.');
+  const oldAccounts=Array.isArray(payload.accounts)?payload.accounts:[];
+  const byOldId=new Map(oldAccounts.map(a=>[a.id,a.name]));
+  const norm=s=>String(s||'').trim().toLowerCase();
+  const mapAccountName=(oldId)=>{
+   const oldName=byOldId.get(oldId);
+   if(!oldName)return null;
+   const match=db.accounts.find(a=>norm(a.name)===norm(oldName));
+   return match?match.id:null;
+  };
+  const incoming=payload.transactions;
+  let added=0, skipped=0;
+  for(const old of incoming){
+   if(!old || !['income','expense','transfer'].includes(old.type) || !old.date || !(Number(old.amount)>0)){skipped++;continue;}
+   const note=String(old.note||'').trim();
+   const duplicate=db.transactions.some(t=>t.date===old.date&&t.type===old.type&&Number(t.amount)===Number(old.amount)&&String(t.note||'').trim()===note&&t.historicalOnly);
+   if(duplicate){skipped++;continue;}
+   const fromName=byOldId.get(old.accountId);
+   const mappedFrom=mapAccountName(old.accountId);
+   const mappedTo=old.toAccountId?mapAccountName(old.toAccountId):null;
+   db.transactions.push({
+    id:id(), type:old.type, date:old.date, accountId:mappedFrom||('historical-'+norm(fromName||'rekening-lama').replace(/\s+/g,'-')),
+    ...(old.type==='transfer'?{toAccountId:mappedTo||('historical-'+norm(byOldId.get(old.toAccountId)||'rekening-tujuan').replace(/\s+/g,'-'))}:{}),
+    amount:Math.round(Number(old.amount)), category:String(old.category||txCategory(old)), note,
+    consumption:!!old.consumption, createdAt:new Date().toISOString(), historicalOnly:true,
+    historicalAccountName:fromName||'Rekening lama',
+    historicalToAccountName:old.toAccountId?byOldId.get(old.toAccountId)||'Rekening tujuan lama':''
+   });
+   added++;
+  }
+  save();
+  status.textContent=`Selesai: ${added} transaksi riwayat ditambahkan, ${skipped} dilewati (duplikat/tidak valid). Saldo rekening tidak berubah.`;
+  alert(status.textContent);
+ }catch(err){status.textContent='Gagal mengimpor: '+(err.message||'format JSON tidak valid');alert(status.textContent);}
+ e.target.value='';
+});
 render();
 </script>
 <script>
